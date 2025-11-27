@@ -1,0 +1,283 @@
+name: "OpenAnalyst Action"
+description: "Run AI-powered code analysis with OpenAnalyst using OpenRouter."
+author: "OpenAnalyst"
+inputs:
+  prompt:
+    description: "Prompt to pass to the AI agent. `prompt` or `prompt-file` must be provided."
+    required: false
+    default: ""
+  prompt-file:
+    description: "Path to file that contains the prompt. `prompt` or `prompt-file` must be provided."
+    required: false
+    default: ""
+  output-file:
+    description: "File where the final AI message is written. Leave empty to skip writing a file."
+    required: false
+    default: ""
+  api-key:
+    description: "OpenRouter API key for accessing AI models."
+    required: false
+    default: ""
+  upstream-url:
+    description: "OpenRouter API base URL. Change this only if using a different provider."
+    required: false
+    default: "https://openrouter.ai/api/v1"
+  working-directory:
+    description: "Working directory for the agent. Defaults to the repository root."
+    required: false
+    default: ""
+  sandbox:
+    description: |
+      Sandbox mode. One of `workspace-write` (default), `read-only` or `danger-full-access`.
+    required: false
+    default: "workspace-write"
+  codex-version:
+    description: "Version of `@openai/codex` CLI to install (uses Codex as the agent runner)."
+    required: false
+    default: ""
+  codex-args:
+    description: "Additional args to pass through to `codex exec`. JSON array or shell-style string."
+    required: false
+    default: ""
+  output-schema:
+    description: "Inline schema contents for structured output."
+    required: false
+    default: ""
+  output-schema-file:
+    description: "File path to the schema for structured output."
+    required: false
+    default: ""
+  model:
+    description: "Model to use (e.g., anthropic/claude-3.5-sonnet, openai/gpt-4o, meta-llama/llama-3.1-70b-instruct)."
+    required: false
+    default: "anthropic/claude-3.5-sonnet"
+  effort:
+    description: "Reasoning effort the agent should use."
+    required: false
+    default: ""
+  codex-home:
+    description: "Directory to use as the agent home directory. If empty, uses default."
+    required: false
+    default: ""
+  safety-strategy:
+    description: |
+      Specify one of the following options (on Windows, the only supported option is `unsafe`):
+
+      * `drop-sudo` (default, IRREVERSIBLE) Drop sudo privileges before running.
+      * `unprivileged-user` Run as the specified user via `codex-user` option.
+      * `read-only` Run in a read-only sandbox.
+      * `unsafe` (NOT RECOMMENDED) No privilege restrictions.
+    required: false
+    default: "drop-sudo"
+  codex-user:
+    description: "Username to run as when `safety-strategy` is `unprivileged-user`."
+    required: false
+    default: ""
+  allow-users:
+    description: "Comma-separated list of GitHub usernames allowed to run this action, or '*' for all."
+    required: false
+    default: ""
+  allow-bots:
+    description: "Allow runs triggered by GitHub Apps/bot accounts to bypass the write-access check."
+    required: false
+    default: "false"
+outputs:
+  final-message:
+    description: "Raw output from the AI agent."
+    value: ${{ steps.run_codex.outputs['final-message'] }}
+runs:
+  using: "composite"
+  steps:
+    - name: Validate Windows safety strategy
+      if: ${{ runner.os == 'Windows' }}
+      shell: bash
+      run: |
+        if [ "${{ inputs['safety-strategy'] }}" != "unsafe" ]; then
+          echo "On Windows, safety-strategy must be 'unsafe'" >&2
+          echo "because no viable sandboxing options are available at this time." >&2
+          exit 1
+        fi
+
+    - name: Ensure Node.js available
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: "20"
+
+    - name: Check repository write access
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      shell: bash
+      run: |
+        node "${{ github.action_path }}/dist/main.js" check-write-access \
+          --allow-bots "${{ inputs['allow-bots'] }}" \
+          --allow-users "${{ inputs['allow-users'] }}"
+
+    - name: Install Codex CLI
+      shell: bash
+      run: npm install -g "@openai/codex@${{ inputs['codex-version'] }}"
+
+    # =========================================================================
+    # CHANGED: Install OpenAnalyst Proxy instead of OpenAI's proxy
+    # =========================================================================
+    - name: Install OpenAnalyst Proxy
+      shell: bash
+      run: |
+        # Install from the openanalyst-proxy directory in this action
+        npm install -g "${{ github.action_path }}/openanalyst-proxy"
+
+    - name: Resolve Codex home
+      id: resolve_home
+      shell: bash
+      run: |
+        node "${{ github.action_path }}/dist/main.js" resolve-codex-home \
+          --codex-home-override "${{ inputs['codex-home'] }}" \
+          --safety-strategy "${{ inputs['safety-strategy'] }}" \
+          --codex-user "${{ inputs['codex-user'] }}" \
+          --github-run-id "${{ github.run_id }}"
+
+    - name: Determine server info path
+      id: derive_server_info
+      shell: bash
+      run: |
+        server_info_file="${{ steps.resolve_home.outputs.codex-home }}/${{ github.run_id }}.json"
+        echo "server_info_file=$server_info_file" >> "$GITHUB_OUTPUT"
+
+    - name: Check proxy status
+      id: start_proxy
+      if: ${{ inputs['api-key'] != '' }}
+      shell: bash
+      run: |
+        server_info_file="${{ steps.derive_server_info.outputs.server_info_file }}"
+        if [ -s "$server_info_file" ]; then
+          echo "OpenAnalyst proxy already appears to be running (found $server_info_file)."
+          echo "server_info_file_exists=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "server_info_file_exists=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # =========================================================================
+    # CHANGED: Start OpenAnalyst Proxy with OpenRouter configuration
+    # =========================================================================
+    - name: Start OpenAnalyst Proxy
+      if: ${{ inputs['api-key'] != '' && steps.start_proxy.outputs.server_info_file_exists == 'false' }}
+      env:
+        PROXY_API_KEY: ${{ inputs['api-key'] }}
+      shell: bash
+      run: |
+        upstream_url="${{ inputs['upstream-url'] }}"
+
+        args=(
+          openanalyst-proxy
+          --http-shutdown
+          --server-info "${{ steps.derive_server_info.outputs.server_info_file }}"
+        )
+
+        if [ -n "$upstream_url" ]; then
+          args+=(--upstream-url "$upstream_url")
+        fi
+
+        # Start proxy in background, piping API key via stdin
+        (
+          printenv PROXY_API_KEY | env -u PROXY_API_KEY "${args[@]}"
+        ) &
+
+    - name: Wait for OpenAnalyst Proxy
+      if: ${{ inputs['api-key'] != '' && steps.start_proxy.outputs.server_info_file_exists == 'false' }}
+      shell: bash
+      run: |
+        server_info_file="${{ steps.derive_server_info.outputs.server_info_file }}"
+        echo "Waiting for OpenAnalyst proxy to start..."
+        for i in {1..15}; do
+          if [ -s "$server_info_file" ]; then
+            echo "Proxy started successfully!"
+            break
+          fi
+          echo "Waiting... ($i/15)"
+          sleep 1
+        done
+        if [ ! -s "$server_info_file" ]; then
+          echo "OpenAnalyst proxy did not start - check your API key" >&2
+          exit 1
+        fi
+
+        if [ "${RUNNER_OS}" != "Windows" ]; then
+          sudo chmod 444 "$server_info_file"
+          sudo chown root "$server_info_file"
+        fi
+
+    - name: Read server info
+      id: read_server_info
+      if: ${{ inputs['api-key'] != '' || inputs.prompt != '' || inputs['prompt-file'] != '' }}
+      shell: bash
+      run: node "${{ github.action_path }}/dist/main.js" read-server-info "${{ steps.derive_server_info.outputs.server_info_file }}"
+
+    - name: Write proxy config
+      if: ${{ inputs['api-key'] != '' }}
+      shell: bash
+      run: |
+        node "${{ github.action_path }}/dist/main.js" write-proxy-config \
+          --codex-home "${{ steps.resolve_home.outputs.codex-home }}" \
+          --port "${{ steps.read_server_info.outputs.port }}" \
+          --safety-strategy "${{ inputs['safety-strategy'] }}"
+
+    - name: Drop sudo privilege, if appropriate
+      if: ${{ inputs['safety-strategy'] == 'drop-sudo' && inputs['api-key'] != '' }}
+      shell: bash
+      run: |
+        case "${RUNNER_OS}" in
+          Linux)
+            node "${{ github.action_path }}/dist/main.js" drop-sudo --user runner --group sudo
+            ;;
+          macOS)
+            node "${{ github.action_path }}/dist/main.js" drop-sudo --user runner --group admin
+            ;;
+          *)
+            echo "Unsupported OS for drop-sudo: ${RUNNER_OS}" >&2
+            exit 1
+            ;;
+        esac
+
+    - name: Verify sudo privilege removed
+      if: ${{ inputs['safety-strategy'] == 'drop-sudo' && inputs['api-key'] != '' }}
+      shell: bash
+      run: |
+        if sudo -n true 2>/dev/null; then
+          echo "Expected sudo to be disabled, but sudo succeeded." >&2
+          exit 1
+        fi
+        echo "Confirmed sudo privilege is disabled."
+
+    - name: Run AI Agent
+      id: run_codex
+      if: ${{ inputs.prompt != '' || inputs['prompt-file'] != '' }}
+      env:
+        CODEX_PROMPT: ${{ inputs.prompt }}
+        CODEX_PROMPT_FILE: ${{ inputs['prompt-file'] }}
+        CODEX_OUTPUT_FILE: ${{ inputs['output-file'] }}
+        CODEX_HOME: ${{ steps.resolve_home.outputs.codex-home }}
+        CODEX_WORKING_DIRECTORY: ${{ inputs['working-directory'] || github.workspace }}
+        CODEX_SANDBOX: ${{ inputs.sandbox }}
+        CODEX_ARGS: ${{ inputs['codex-args'] }}
+        CODEX_OUTPUT_SCHEMA: ${{ inputs['output-schema'] }}
+        CODEX_OUTPUT_SCHEMA_FILE: ${{ inputs['output-schema-file'] }}
+        CODEX_MODEL: ${{ inputs.model }}
+        CODEX_EFFORT: ${{ inputs.effort }}
+        CODEX_SAFETY_STRATEGY: ${{ inputs['safety-strategy'] }}
+        CODEX_USER: ${{ inputs['codex-user'] }}
+        FORCE_COLOR: 1
+      shell: bash
+      run: |
+        node "${{ github.action_path }}/dist/main.js" run-codex-exec \
+            --prompt "${CODEX_PROMPT}" \
+            --prompt-file "${CODEX_PROMPT_FILE}" \
+            --output-file "$CODEX_OUTPUT_FILE" \
+            --codex-home "$CODEX_HOME" \
+            --cd "$CODEX_WORKING_DIRECTORY" \
+            --extra-args "$CODEX_ARGS" \
+            --output-schema "$CODEX_OUTPUT_SCHEMA" \
+            --output-schema-file "$CODEX_OUTPUT_SCHEMA_FILE" \
+            --sandbox "$CODEX_SANDBOX" \
+            --model "$CODEX_MODEL" \
+            --effort "$CODEX_EFFORT" \
+            --safety-strategy "$CODEX_SAFETY_STRATEGY" \
+            --codex-user "$CODEX_USER"

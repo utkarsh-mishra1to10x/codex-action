@@ -1,0 +1,1 @@
+{"version":3,"file":"request-translator.d.ts","sourceRoot":"","sources":["../../src/translators/request-translator.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;GAYG;AAEH,OAAO,EACL,mBAAmB,EAGnB,sBAAsB,EAIvB,MAAM,UAAU,CAAC;AA6KlB;;GAEG;AACH,wBAAgB,gBAAgB,CAC9B,gBAAgB,EAAE,mBAAmB,GACpC,sBAAsB,CAwCxB;AAED;;GAEG;AACH,wBAAgB,eAAe,CAAC,OAAO,EAAE,OAAO,GAAG,mBAAmB,CAuBrE"}
