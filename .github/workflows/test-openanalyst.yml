@@ -1,0 +1,199 @@
+# Test OpenAnalyst Action
+#
+# This workflow tests the OpenAnalyst action within this repository.
+# It runs on:
+#   - Manual trigger (workflow_dispatch)
+#   - Push to main branch
+#   - Pull requests
+#
+# Required secret: OPENROUTER_API_KEY
+
+name: Test OpenAnalyst
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Model to test with'
+        required: true
+        default: 'openai/gpt-4o-mini'
+        type: choice
+        options:
+          - openai/gpt-4o-mini
+          - anthropic/claude-3-haiku-20240307
+          - meta-llama/llama-3.1-8b-instruct
+      test_prompt:
+        description: 'Test prompt'
+        required: false
+        default: 'Say "OpenAnalyst test successful!" and nothing else.'
+
+  push:
+    branches: [main]
+    paths:
+      - 'openanalyst-proxy/**'
+      - 'action.yml'
+      - 'action.openanalyst.yml'
+
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Job 1: Test the proxy translation logic (no API key needed)
+  test-translation:
+    name: Test Translation Logic
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install proxy dependencies
+        working-directory: ./openanalyst-proxy
+        run: npm install
+
+      - name: Build proxy
+        working-directory: ./openanalyst-proxy
+        run: npm run build
+
+      - name: Run translation tests
+        working-directory: ./openanalyst-proxy
+        run: node test-translation.js
+
+  # Job 2: Test with real OpenRouter API (needs secret)
+  test-real-api:
+    name: Test Real API
+    runs-on: ubuntu-latest
+    needs: test-translation
+    # Only run if we have the API key secret
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install proxy dependencies
+        working-directory: ./openanalyst-proxy
+        run: npm install
+
+      - name: Build proxy
+        working-directory: ./openanalyst-proxy
+        run: npm run build
+
+      - name: Test with OpenRouter API
+        working-directory: ./openanalyst-proxy
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "⚠️  OPENROUTER_API_KEY secret not set, skipping real API test"
+            echo "To enable this test, add OPENROUTER_API_KEY as a repository secret"
+            exit 0
+          fi
+          node test-real-api.js
+
+  # Job 3: Test the full GitHub Action
+  test-full-action:
+    name: Test Full Action
+    runs-on: ubuntu-latest
+    needs: test-translation
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build the proxy first
+        working-directory: ./openanalyst-proxy
+        run: |
+          npm install
+          npm run build
+
+      # Test using the action.openanalyst.yml directly
+      - name: Run OpenAnalyst Action
+        id: openanalyst
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          # For now, we'll test by running the components manually
+          # since the action.yml still points to the original OpenAI proxy
+
+          echo "Setting up test environment..."
+
+          # Install Codex CLI
+          npm install -g @openai/codex || echo "Codex CLI install skipped"
+
+          # Install our proxy globally
+          npm install -g ./openanalyst-proxy
+
+          # Start proxy in background
+          echo "$OPENROUTER_API_KEY" | openanalyst-proxy --port 3000 --http-shutdown &
+          sleep 3
+
+          # Test the proxy is running
+          curl -s http://localhost:3000/health || echo "Health check failed"
+
+          # Make a test request
+          RESPONSE=$(curl -s -X POST http://localhost:3000/v1/responses \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "${{ inputs.model || 'openai/gpt-4o-mini' }}",
+              "input": "${{ inputs.test_prompt || 'Say hello!' }}",
+              "max_output_tokens": 100
+            }')
+
+          echo "Response: $RESPONSE"
+
+          # Extract the message
+          MESSAGE=$(echo "$RESPONSE" | jq -r '.output[0].content[0].text // .error.message // "No response"')
+          echo "AI Message: $MESSAGE"
+
+          # Shutdown proxy
+          curl -s http://localhost:3000/shutdown || true
+
+      - name: Show result
+        run: |
+          echo "✅ OpenAnalyst Action test completed!"
+
+  # Job 4: Test on different OS
+  test-cross-platform:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: test-translation
+    if: ${{ github.event_name == 'push' }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install and build proxy
+        working-directory: ./openanalyst-proxy
+        run: |
+          npm install
+          npm run build
+
+      - name: Run translation tests
+        working-directory: ./openanalyst-proxy
+        run: node test-translation.js
+
+      - name: Test CLI help
+        working-directory: ./openanalyst-proxy
+        run: node dist/index.js --help

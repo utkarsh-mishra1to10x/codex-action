@@ -1,0 +1,69 @@
+# Example: OpenAnalyst Code Review Workflow
+#
+# This workflow runs OpenAnalyst to review pull requests using OpenRouter.
+# It supports multiple AI models: Claude, GPT-4, Llama, Mistral, and more.
+#
+# Setup:
+# 1. Get an API key from https://openrouter.ai/keys
+# 2. Add it as a secret named OPENROUTER_API_KEY in your repository
+
+name: OpenAnalyst Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        run: |
+          git fetch --no-tags origin ${{ github.event.pull_request.base.ref }}
+
+      - name: Run OpenAnalyst
+        id: review
+        uses: ./  # Change to: yourorg/openanalyst-action@v1
+        with:
+          api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          model: "anthropic/claude-3.5-sonnet"  # Or: openai/gpt-4o, meta-llama/llama-3.1-70b-instruct
+          prompt: |
+            You are a code reviewer. Review the changes in this pull request.
+
+            PR Title: ${{ github.event.pull_request.title }}
+            PR Description: ${{ github.event.pull_request.body }}
+
+            To see the changes, run:
+            git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+
+            Provide feedback on:
+            1. Code quality and best practices
+            2. Potential bugs or issues
+            3. Security concerns
+            4. Suggestions for improvement
+
+            Be constructive and specific. Reference file names and line numbers when possible.
+
+      - name: Post review comment
+        if: steps.review.outputs.final-message != ''
+        uses: actions/github-script@v7
+        env:
+          REVIEW_COMMENT: ${{ steps.review.outputs.final-message }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## OpenAnalyst Code Review\n\n${process.env.REVIEW_COMMENT}`
+            });

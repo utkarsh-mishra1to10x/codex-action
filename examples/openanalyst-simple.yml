@@ -1,0 +1,50 @@
+# Example: Simple OpenAnalyst Usage
+#
+# This is the simplest way to use OpenAnalyst with OpenRouter.
+# It runs on manual trigger and lets you provide any prompt.
+
+name: Run OpenAnalyst
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'What should OpenAnalyst do?'
+        required: true
+        default: 'List all files in the repository and describe what each one does.'
+      model:
+        description: 'AI Model to use'
+        required: true
+        default: 'anthropic/claude-3.5-sonnet'
+        type: choice
+        options:
+          - anthropic/claude-3.5-sonnet
+          - anthropic/claude-3-opus
+          - openai/gpt-4o
+          - openai/gpt-4o-mini
+          - meta-llama/llama-3.1-70b-instruct
+          - mistralai/mistral-large
+          - google/gemini-pro-1.5
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run OpenAnalyst
+        id: analysis
+        uses: ./  # Change to: yourorg/openanalyst-action@v1
+        with:
+          api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          model: ${{ inputs.model }}
+          prompt: ${{ inputs.prompt }}
+
+      - name: Show Result
+        run: |
+          echo "=== OpenAnalyst Output ==="
+          echo "${{ steps.analysis.outputs.final-message }}"
