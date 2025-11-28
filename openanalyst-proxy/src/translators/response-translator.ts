@@ -18,6 +18,7 @@ import {
   ResponsesAPIResponse,
   ResponsesOutputMessage,
   ResponsesStreamEvent,
+  ResponsesOutputItem,
   OpenRouterError,
 } from "../types";
 
@@ -161,11 +162,14 @@ export function translateError(
 export interface StreamState {
   responseId: string;
   messageId: string;
+  contentPartId: string;
   model: string;
   createdAt: number;
   accumulatedText: string;
   inputTokens: number;
   outputTokens: number;
+  hasStartedOutput: boolean;  // Track if we've sent output_item.added
+  hasAddedContentPart: boolean; // Track if we've sent content_part.added
 }
 
 /**
@@ -175,16 +179,31 @@ export function createStreamState(model: string): StreamState {
   return {
     responseId: generateId("resp"),
     messageId: generateId("msg"),
+    contentPartId: generateId("cp"),
     model: model,
     createdAt: Math.floor(Date.now() / 1000),
     accumulatedText: "",
     inputTokens: 0,
     outputTokens: 0,
+    hasStartedOutput: false,
+    hasAddedContentPart: false,
   };
 }
 
 /**
  * Translate a streaming chunk to Responses API event
+ *
+ * Codex CLI expects events in this order:
+ * 1. response.created (sent separately)
+ * 2. response.in_progress
+ * 3. response.output_item.added (when first content comes)
+ * 4. response.content_part.added
+ * 5. response.output_text.delta (multiple times)
+ * 6. response.output_text.done
+ * 7. response.content_part.done
+ * 8. response.output_item.done
+ * 9. response.completed
+ * 10. response.done (CRITICAL - must be last!)
  */
 export function translateStreamChunk(
   chunk: ChatStreamChunk,
@@ -199,50 +218,149 @@ export function translateStreamChunk(
 
   // Check for content delta
   if (choice.delta.content) {
+    // First content? Send output_item.added and content_part.added
+    if (!state.hasStartedOutput) {
+      state.hasStartedOutput = true;
+
+      // Send response.output_item.added
+      events.push({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "message",
+          id: state.messageId,
+          role: "assistant",
+          content: [],
+          status: "in_progress",
+        },
+      });
+
+      // Send response.content_part.added
+      events.push({
+        type: "response.content_part.added",
+        output_index: 0,
+        content_index: 0,
+        part: {
+          type: "output_text",
+          text: "",
+        },
+      });
+
+      state.hasAddedContentPart = true;
+    }
+
     state.accumulatedText += choice.delta.content;
 
+    // Send text delta
     events.push({
       type: "response.output_text.delta",
+      output_index: 0,
+      content_index: 0,
       delta: choice.delta.content,
     });
   }
 
   // Check if stream is done
   if (choice.finish_reason) {
-    // Send the "text done" event
+    // If we never got content, send the output_item.added events now
+    if (!state.hasStartedOutput) {
+      state.hasStartedOutput = true;
+      events.push({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "message",
+          id: state.messageId,
+          role: "assistant",
+          content: [],
+          status: "in_progress",
+        },
+      });
+      events.push({
+        type: "response.content_part.added",
+        output_index: 0,
+        content_index: 0,
+        part: {
+          type: "output_text",
+          text: "",
+        },
+      });
+    }
+
+    // 1. Send response.output_text.done
     events.push({
       type: "response.output_text.done",
+      output_index: 0,
+      content_index: 0,
       text: state.accumulatedText,
     });
 
-    // Send the final "response done" event
+    // 2. Send response.content_part.done
     events.push({
-      type: "response.done",
-      response: {
-        id: state.responseId,
-        object: "response",
-        created_at: state.createdAt,
-        model: state.model,
-        status: mapFinishReasonToStatus(choice.finish_reason),
-        output: [
+      type: "response.content_part.done",
+      output_index: 0,
+      content_index: 0,
+      part: {
+        type: "output_text",
+        text: state.accumulatedText,
+      },
+    });
+
+    // 3. Send response.output_item.done
+    events.push({
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        type: "message",
+        id: state.messageId,
+        role: "assistant",
+        content: [
           {
-            type: "message",
-            id: state.messageId,
-            role: "assistant",
-            content: [
-              {
-                type: "output_text",
-                text: state.accumulatedText,
-              },
-            ],
+            type: "output_text",
+            text: state.accumulatedText,
           },
         ],
-        usage: {
-          input_tokens: state.inputTokens,
-          output_tokens: state.outputTokens,
-          total_tokens: state.inputTokens + state.outputTokens,
-        },
+        status: "completed",
       },
+    });
+
+    // 4. Build the final response object
+    const finalResponse: ResponsesAPIResponse = {
+      id: state.responseId,
+      object: "response",
+      created_at: state.createdAt,
+      model: state.model,
+      status: mapFinishReasonToStatus(choice.finish_reason),
+      output: [
+        {
+          type: "message",
+          id: state.messageId,
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: state.accumulatedText,
+            },
+          ],
+        },
+      ],
+      usage: {
+        input_tokens: state.inputTokens,
+        output_tokens: state.outputTokens,
+        total_tokens: state.inputTokens + state.outputTokens,
+      },
+    };
+
+    // 5. Send response.completed
+    events.push({
+      type: "response.completed",
+      response: finalResponse,
+    });
+
+    // 6. Send response.done (CRITICAL - Codex waits for this!)
+    events.push({
+      type: "response.done",
+      response: finalResponse,
     });
   }
 
@@ -255,6 +373,28 @@ export function translateStreamChunk(
 export function createResponseCreatedEvent(state: StreamState): ResponsesStreamEvent {
   return {
     type: "response.created",
+    response: {
+      id: state.responseId,
+      object: "response",
+      created_at: state.createdAt,
+      model: state.model,
+      status: "in_progress",
+      output: [],
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+      },
+    },
+  };
+}
+
+/**
+ * Create the "response.in_progress" event for streaming
+ */
+export function createResponseInProgressEvent(state: StreamState): ResponsesStreamEvent {
+  return {
+    type: "response.in_progress",
     response: {
       id: state.responseId,
       object: "response",

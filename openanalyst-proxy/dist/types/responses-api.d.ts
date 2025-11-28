@@ -101,9 +101,33 @@ export interface ResponsesAPIResponse {
         message: string;
     };
 }
+/**
+ * Output item for streaming - represents a message being built
+ */
+export interface ResponsesOutputItem {
+    type: "message";
+    id: string;
+    role: "assistant";
+    content: ResponsesOutputText[];
+    status?: "in_progress" | "completed";
+}
+/**
+ * Content part for streaming
+ */
+export interface ResponsesContentPart_Output {
+    type: "output_text";
+    text: string;
+}
+/**
+ * All possible streaming event types that Codex CLI expects
+ */
 export interface ResponsesStreamEvent {
-    type: "response.created" | "response.output_item.added" | "response.output_text.delta" | "response.output_text.done" | "response.done" | "error";
+    type: "response.created" | "response.in_progress" | "response.output_item.added" | "response.output_item.done" | "response.content_part.added" | "response.content_part.done" | "response.output_text.delta" | "response.output_text.done" | "response.completed" | "response.done" | "error";
     response?: ResponsesAPIResponse;
+    output_index?: number;
+    item?: ResponsesOutputItem;
+    content_index?: number;
+    part?: ResponsesContentPart_Output;
     delta?: string;
     text?: string;
     error?: {

@@ -19,6 +19,7 @@ import {
   translateStreamChunk,
   createStreamState,
   createResponseCreatedEvent,
+  createResponseInProgressEvent,
   formatSSE,
 } from "./translators";
 import { OpenRouterClient } from "./openrouter-client";
@@ -143,6 +144,18 @@ export function createServer(config: ServerConfig): express.Application {
 
 /**
  * Handle streaming requests
+ *
+ * Codex CLI expects events in this specific order:
+ * 1. response.created
+ * 2. response.in_progress
+ * 3. response.output_item.added (when first content arrives)
+ * 4. response.content_part.added
+ * 5. response.output_text.delta (multiple)
+ * 6. response.output_text.done
+ * 7. response.content_part.done
+ * 8. response.output_item.done
+ * 9. response.completed
+ * 10. response.done
  */
 async function handleStreamingRequest(
   res: Response,
@@ -162,14 +175,44 @@ async function handleStreamingRequest(
   const state = createStreamState(responsesRequest.model);
 
   try {
-    // Send initial "response.created" event
+    // 1. Send "response.created" event
     const createdEvent = createResponseCreatedEvent(state);
     res.write(formatSSE(createdEvent));
+
+    // 2. Send "response.in_progress" event
+    const inProgressEvent = createResponseInProgressEvent(state);
+    res.write(formatSSE(inProgressEvent));
 
     // Stream from OpenRouter
     for await (const chunk of openRouterClient.createStreamingCompletion(chatRequest)) {
       const events = translateStreamChunk(chunk, state);
 
+      for (const event of events) {
+        res.write(formatSSE(event));
+      }
+    }
+
+    // If stream ended without finish_reason, send completion events
+    // This handles edge cases where OpenRouter doesn't send a proper finish
+    if (!state.hasStartedOutput) {
+      console.log("[Server] Stream ended without content, sending empty response");
+      // Force a completion with empty content
+      const events = translateStreamChunk(
+        {
+          id: "empty",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: responsesRequest.model,
+          choices: [
+            {
+              index: 0,
+              delta: { content: "" },
+              finish_reason: "stop",
+            },
+          ],
+        },
+        state
+      );
       for (const event of events) {
         res.write(formatSSE(event));
       }
@@ -188,6 +231,7 @@ async function handleStreamingRequest(
       })
     );
   } finally {
+    console.log("[Server] Streaming complete, closing connection");
     res.end();
   }
 }
