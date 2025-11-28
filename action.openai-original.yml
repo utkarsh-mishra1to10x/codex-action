@@ -1,80 +1,96 @@
-name: "OpenAnalyst Action"
-description: "Run AI-powered code analysis with OpenAnalyst using OpenRouter."
-author: "OpenAnalyst"
+name: "Codex Exec Action"
+description: "Run `codex exec` with a prompt."
+author: "OpenAI"
 inputs:
   prompt:
-    description: "Prompt to pass to the AI agent. `prompt` or `prompt-file` must be provided."
+    description: "Prompt to pass to Codex. `prompt` or `prompt-file` must be provided."
     required: false
     default: ""
   prompt-file:
-    description: "Path to file that contains the prompt. `prompt` or `prompt-file` must be provided."
+    description: "Path to file that contains the prompt to pass to Codex. `prompt` or `prompt-file` must be provided."
     required: false
     default: ""
   output-file:
-    description: "File where the final AI message is written. Leave empty to skip writing a file."
+    description: "File where the final Codex message is written. Leave empty to skip writing a file."
     required: false
     default: ""
-  api-key:
-    description: "OpenRouter API key for accessing AI models."
+  openai-api-key:
+    description: "OpenAI API key used by Codex."
     required: false
     default: ""
-  upstream-url:
-    description: "OpenRouter API base URL. Change this only if using a different provider."
+  responses-api-endpoint:
+    description: "Optional Responses API endpoint override, e.g. https://example.openai.azure.com/openai/v1/responses. Defaults to the proxy's built-in endpoint when empty."
     required: false
-    default: "https://openrouter.ai/api/v1"
+    default: ""
   working-directory:
-    description: "Working directory for the agent. Defaults to the repository root."
+    description: "Working directory that Codex should use. Defaults to the repository root."
     required: false
     default: ""
   sandbox:
     description: |
-      Sandbox mode. One of `workspace-write` (default), `read-only` or `danger-full-access`.
+      Sandbox mode for Codex. One of `workspace-write` (default), `read-only` or `danger-full-access`.
     required: false
     default: "workspace-write"
   codex-version:
-    description: "Version of `@openai/codex` CLI to install (uses Codex as the agent runner)."
+    description: "Version of `@openai/codex` to install."
     required: false
     default: ""
   codex-args:
-    description: "Additional args to pass through to `codex exec`. JSON array or shell-style string."
+    description: "Additional args to pass through to `codex exec`. If this value starts with `[`, it will be parsed as a JSON array; otherwise, it will be parsed as a shell-like string."
     required: false
     default: ""
   output-schema:
-    description: "Inline schema contents for structured output."
+    description: "Inline schema contents to use with `codex exec --output-schema`."
     required: false
     default: ""
   output-schema-file:
-    description: "File path to the schema for structured output."
+    description: "File path to the schema that should be passed to `codex exec --output-schema`."
     required: false
     default: ""
   model:
-    description: "Model to use (e.g., anthropic/claude-3.5-sonnet, openai/gpt-4o, meta-llama/llama-3.1-70b-instruct)."
+    description: "Model the agent should use."
     required: false
-    default: "anthropic/claude-3.5-sonnet"
+    default: ""
   effort:
     description: "Reasoning effort the agent should use."
     required: false
     default: ""
   codex-home:
-    description: "Directory to use as the agent home directory. If empty, uses default."
+    description: "Directory to use as the Codex home directory. If empty, the default Codex home directory will be used."
     required: false
     default: ""
   safety-strategy:
     description: |
       Specify one of the following options (on Windows, the only supported option is `unsafe`):
 
-      * `drop-sudo` (default, IRREVERSIBLE) Drop sudo privileges before running.
-      * `unprivileged-user` Run as the specified user via `codex-user` option.
-      * `read-only` Run in a read-only sandbox.
-      * `unsafe` (NOT RECOMMENDED) No privilege restrictions.
+      * `drop-sudo` (default, IRREVERSIBLE) Drop sudo privileges (if any) from
+        the default user before running Codex, and run Codex as that user. This
+        is only supported on Linux and macOS runners. This option is
+        irreversible: if the default user has sudo privileges, they will be
+        removed permanently for the duration of the job.
+      * `unprivileged-user` Run Codex as the specified user specified by the
+        `codex-user` option (the user must already exist). Note the caller is
+        responsible for ensuring the specified user has the privileges it needs
+        to perform the requested actions. For example, the copy of the repo
+        created by `actions/checkout` is not world-readable by default.
+      * `read-only` Run Codex in a sandbox that can read any file on disk,
+        but cannot write to disk or access the network. Note Codex will still
+        run as the default user for this Action, which likely has sudo
+        privileges, so it could read `openai-api-key` from memory and reveal it
+        by printing it to the output of the GitHub Action.
+      * `unsafe` (NOT RECOMMENDED) Do not try to restrict Codex's privileges at all.
+        This is extremely dangerous, as the default user for this Action likely
+        has sudo privileges, which means it can read secrets stored in memory
+        (such as the value of `openai-api-key`) and print them to the output
+        of the GitHub Action or exfiltrate them in other ways.
     required: false
     default: "drop-sudo"
   codex-user:
-    description: "Username to run as when `safety-strategy` is `unprivileged-user`."
+    description: "If `safety-strategy` is set to `unprivileged-user`, this specifies the UNIX username to run Codex as."
     required: false
     default: ""
   allow-users:
-    description: "Comma-separated list of GitHub usernames allowed to run this action, or '*' for all."
+    description: "Comma-separated list of GitHub usernames who can run this action, or '*' to allow all users. Note users who have write access to the GitHub repo have access by default and do not need to be listed here."
     required: false
     default: ""
   allow-bots:
@@ -83,7 +99,7 @@ inputs:
     default: "false"
 outputs:
   final-message:
-    description: "Raw output from the AI agent."
+    description: "Raw output emitted by `codex exec`."
     value: ${{ steps.run_codex.outputs['final-message'] }}
 runs:
   using: "composite"
@@ -93,12 +109,14 @@ runs:
       shell: bash
       run: |
         if [ "${{ inputs['safety-strategy'] }}" != "unsafe" ]; then
-          echo "On Windows, safety-strategy must be 'unsafe'" >&2
+          echo "On Windows, inputs['safety-strategy'] must be 'unsafe'" >&2
           echo "because no viable sandboxing options are available at this time." >&2
           exit 1
         fi
 
     - name: Ensure Node.js available
+      # Pin to a commit hash because some repositories require it:
+      # https://github.com/openai/codex-action/issues/43
       uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
       with:
         node-version: "20"
@@ -116,14 +134,9 @@ runs:
       shell: bash
       run: npm install -g "@openai/codex@${{ inputs['codex-version'] }}"
 
-    # =========================================================================
-    # CHANGED: Install OpenAnalyst Proxy instead of OpenAI's proxy
-    # =========================================================================
-    - name: Install OpenAnalyst Proxy
+    - name: Install Codex Responses API proxy
       shell: bash
-      run: |
-        # Install from the openanalyst-proxy directory in this action
-        npm install -g "${{ github.action_path }}/openanalyst-proxy"
+      run: npm install -g "@openai/codex-responses-api-proxy@${{ inputs['codex-version'] }}"
 
     - name: Resolve Codex home
       id: resolve_home
@@ -142,32 +155,33 @@ runs:
         server_info_file="${{ steps.resolve_home.outputs.codex-home }}/${{ github.run_id }}.json"
         echo "server_info_file=$server_info_file" >> "$GITHUB_OUTPUT"
 
-    - name: Check proxy status
+    - name: Check Responses API proxy status
       id: start_proxy
-      if: ${{ inputs['api-key'] != '' }}
+      if: ${{ inputs['openai-api-key'] != '' }}
       shell: bash
       run: |
         server_info_file="${{ steps.derive_server_info.outputs.server_info_file }}"
         if [ -s "$server_info_file" ]; then
-          echo "OpenAnalyst proxy already appears to be running (found $server_info_file)."
+          echo "Responses API proxy already appears to be running (found $server_info_file)."
           echo "server_info_file_exists=true" >> "$GITHUB_OUTPUT"
         else
           echo "server_info_file_exists=false" >> "$GITHUB_OUTPUT"
         fi
 
-    # =========================================================================
-    # CHANGED: Start OpenAnalyst Proxy with OpenRouter configuration
-    # =========================================================================
-    - name: Start OpenAnalyst Proxy
-      if: ${{ inputs['api-key'] != '' && steps.start_proxy.outputs.server_info_file_exists == 'false' }}
+    # This is its own step to minimize the runtime logic that has access to the
+    # API key. Note we use `env -u PROXY_API_KEY` to ensure extra copies of the
+    # key do not end up in the memory of the `codex-responses-api-proxy`
+    # process where environment variables are stored.
+    - name: Start Responses API proxy
+      if: ${{ inputs['openai-api-key'] != '' && steps.start_proxy.outputs.server_info_file_exists == 'false' }}
       env:
-        PROXY_API_KEY: ${{ inputs['api-key'] }}
+        PROXY_API_KEY: ${{ inputs['openai-api-key'] }}
       shell: bash
       run: |
-        upstream_url="${{ inputs['upstream-url'] }}"
+        upstream_url="${{ inputs['responses-api-endpoint'] }}"
 
         args=(
-          openanalyst-proxy
+          codex-responses-api-proxy
           --http-shutdown
           --server-info "${{ steps.derive_server_info.outputs.server_info_file }}"
         )
@@ -176,27 +190,23 @@ runs:
           args+=(--upstream-url "$upstream_url")
         fi
 
-        # Start proxy in background, piping API key via stdin
         (
           printenv PROXY_API_KEY | env -u PROXY_API_KEY "${args[@]}"
         ) &
 
-    - name: Wait for OpenAnalyst Proxy
-      if: ${{ inputs['api-key'] != '' && steps.start_proxy.outputs.server_info_file_exists == 'false' }}
+    - name: Wait for Responses API proxy
+      if: ${{ inputs['openai-api-key'] != '' && steps.start_proxy.outputs.server_info_file_exists == 'false' }}
       shell: bash
       run: |
         server_info_file="${{ steps.derive_server_info.outputs.server_info_file }}"
-        echo "Waiting for OpenAnalyst proxy to start..."
-        for i in {1..15}; do
+        for _ in {1..10}; do
           if [ -s "$server_info_file" ]; then
-            echo "Proxy started successfully!"
             break
           fi
-          echo "Waiting... ($i/15)"
           sleep 1
         done
         if [ ! -s "$server_info_file" ]; then
-          echo "OpenAnalyst proxy did not start - check your API key" >&2
+          echo "responses-api-proxy did not write server info" >&2
           exit 1
         fi
 
@@ -205,14 +215,15 @@ runs:
           sudo chown root "$server_info_file"
         fi
 
+    # This step has an output named `port`.
     - name: Read server info
       id: read_server_info
-      if: ${{ inputs['api-key'] != '' || inputs.prompt != '' || inputs['prompt-file'] != '' }}
+      if: ${{ inputs['openai-api-key'] != '' || inputs.prompt != '' || inputs['prompt-file'] != '' }}
       shell: bash
       run: node "${{ github.action_path }}/dist/main.js" read-server-info "${{ steps.derive_server_info.outputs.server_info_file }}"
 
-    - name: Write proxy config
-      if: ${{ inputs['api-key'] != '' }}
+    - name: Write Codex proxy config
+      if: ${{ inputs['openai-api-key'] != '' }}
       shell: bash
       run: |
         node "${{ github.action_path }}/dist/main.js" write-proxy-config \
@@ -221,7 +232,7 @@ runs:
           --safety-strategy "${{ inputs['safety-strategy'] }}"
 
     - name: Drop sudo privilege, if appropriate
-      if: ${{ inputs['safety-strategy'] == 'drop-sudo' && inputs['api-key'] != '' }}
+      if: ${{ inputs['safety-strategy'] == 'drop-sudo' && inputs['openai-api-key'] != '' }}
       shell: bash
       run: |
         case "${RUNNER_OS}" in
@@ -238,7 +249,7 @@ runs:
         esac
 
     - name: Verify sudo privilege removed
-      if: ${{ inputs['safety-strategy'] == 'drop-sudo' && inputs['api-key'] != '' }}
+      if: ${{ inputs['safety-strategy'] == 'drop-sudo' && inputs['openai-api-key'] != '' }}
       shell: bash
       run: |
         if sudo -n true 2>/dev/null; then
@@ -247,7 +258,7 @@ runs:
         fi
         echo "Confirmed sudo privilege is disabled."
 
-    - name: Run AI Agent
+    - name: Run codex exec
       id: run_codex
       if: ${{ inputs.prompt != '' || inputs['prompt-file'] != '' }}
       env:
